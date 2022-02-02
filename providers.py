@@ -152,7 +152,7 @@ class AVDataProvider(DataProvider):
 
         # Otherwise, download it.  Intraday data is divided into 30-day
         # segments, so first determine just how far back to look.
-        days = (_now().floor('d') - day.floor('d')).days - 1
+        days = (_now().floor('d') - day.floor('d')).days
         month = (days // 30) % 12 + 1
         year = (days // 360) + 1
         params = {"function": "TIME_SERIES_INTRADAY_EXTENDED",
