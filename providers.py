@@ -71,7 +71,7 @@ class AVDataProvider(DataProvider):
 
     def __init__(self, ticker: str, *,
                  reqs_per_minute: int = 5, cache: str = "cache",
-                 local_cache_size: int = 10,
+                 memory_cache_size: int = 10,
                  **kwargs: Dict[str, Any]):
         """
         Init function.
@@ -80,7 +80,7 @@ class AVDataProvider(DataProvider):
         +ticker+ provides the ticker symbol for the underlying FD.
         +cache+ provides a directory which the DataProvider can use to
         organize data.
-        +local_cache_size+ is the total number of entries to keep on-hand to
+        +memory_cache_size+ is the total number of entries to keep on-hand to
         speed up repeated accesses.
 
         NOTE: This object assumes it is the only user of the API key at any
@@ -89,11 +89,11 @@ class AVDataProvider(DataProvider):
         self.ticker = ticker
         self.reqs_per_minute = reqs_per_minute
         self.cache = pathlib.Path(cache)
-        self.local_cache_size = local_cache_size
+        self.memory_cache_size = memory_cache_size
 
         self._calls = []
-        self._local_cache = {}
-        self._local_cache_history = []
+        self._memory_cache = {}
+        self._memory_cache_history = []
 
         # Ensure the cache is suitable
         if self.cache.exists() and not self.cache.is_dir():
@@ -106,30 +106,141 @@ class AVDataProvider(DataProvider):
             raise RuntimeError("No AlphaVantage API key detected - please set "
                                "SKINTBROKER_AV_API_KEY")
 
-    def _check_local_cache(self, filename: pathlib.Path):
+    def _check_memory_cache(self, key: str):
         """
-        Checks for data associated with a given +filename+ in the local cache.
+        Checks for data associated with a given +key+ in the memory cache.
         If found, return it, else return None.
         """
-        if str(filename) in self._local_cache:
-            cache_entry = self._local_cache[str(filename)]
-            if len(self._local_cache) == self.local_cache_size:
-                self._local_cache_history.remove(str(filename))
-                self._local_cache_history.append(str(filename))
+        if key in self._memory_cache:
+            cache_entry = self._memory_cache[key]
+            if len(self._memory_cache) == self.memory_cache_size:
+                self._memory_cache_history.remove(key)
+                self._memory_cache_history.append(key)
             return cache_entry
         return None
 
-    def _add_local_cache(self, filename: pathlib.Path, frame: pd.DataFrame):
+    def _add_memory_cache(self, key: str, frame: pd.DataFrame):
         """
-        Adds a +frame+ associated with a given +filename+ to the local cache.
+        Adds a +frame+ associated with a given +key+ to the memory cache.
         If the cache is full, pops off the least recently accessed entry.
         """
+        # First, ensure we're not adding a duplicate
+        if self._check_memory_cache(key) is not None:
+            return
+
         # If necessary, purge the oldest item from the cache
-        if len(self._local_cache) == self.local_cache_size:
-            old_name = self._local_cache_history.pop(0)
-            del self._local_cache[old_name]
-        self._local_cache[str(filename)] = frame
-        self._local_cache_history.append(str(filename))
+        if len(self._memory_cache) == self.memory_cache_size:
+            old_name = self._memory_cache_history.pop(0)
+            del self._memory_cache[old_name]
+        self._memory_cache[key] = frame
+        self._memory_cache_history.append(key)
+
+    def _get_key_by_timestamp(self, time: pd.Timestamp, interval: str):
+        """
+        Gets the key used to index the local cache for a given +time+ for
+        data associated with a given +interval+, such as "day".
+
+        Note that when 3.10+ is supported, the interval can become an enum.
+        """
+        simple_keys = {
+            "weekly": "per_week",
+            "monthly": "per_month"
+            }
+        if interval == "daily":
+            return f"{time.year}_per_day"
+        if interval == "intraday":
+            return f"{time.day}_{time.month}_{time.year}_per_minute"
+        elif interval in simple_keys:
+            return simple_keys[interval]
+
+        raise RuntimeError("Interval '{interval}' not supported!")            
+
+    def _get_cached_data(self, time: pd.Timestamp, interval: str):
+        """
+        Gets any locally cached data for a given +time+ for data associated
+        with a given +interval+, such as "day".  There are two layers of
+        caching - one is a direct memory cache of the relevant dataframe,
+        the other is persistent.
+
+        Note that when 3.10+ is supported, +interval+ can become an enum.
+        """
+
+        # First check the memory cache
+        key = self._get_key_by_timestamp(time, interval)
+        data = self._check_memory_cache(key)
+        if data is not None:
+            return data
+
+        # Next, check the persistent cache
+        return self._check_persistent_cache(time, interval)
+
+    def __get_csv_path(self, time: pd.Timestamp, interval: str):
+        """
+        Gets the CSV associated with a given +time+ and +interval+.
+        """
+        cache_dir = self.cache/self.ticker
+        key = self._get_key_by_timestamp(time, interval)
+        if interval == "intraday":
+            return cache_dir/str(time.year)/str(time.month)/f"{key}.csv"
+        if interval == "daily":
+            return cache_dir/str(time.year)/f"{key}.csv"
+        if interval in ["weekly", "monthly"]:
+            return cache_dir/f"{key}.csv"
+        else:
+            raise RuntimeError("Interval '{interval}' not supported!")            
+
+    def _check_persistent_cache(self, time: pd.Timestamp, interval: str):
+        """
+        Gets any data cached in persistent space for a given +time+ for
+        data associated with a given +interval+, such as "day".  For
+        this implementation, this includes searching a file hierarchy.
+        """
+        key = self._get_key_by_timestamp(time, interval)
+        csv = self.__get_csv_path(time, interval)
+
+        update = True
+        if csv.exists():
+            frame = pd.read_csv(csv, parse_dates=[0],
+                                infer_datetime_format=True,
+                                index_col='time')
+
+            # If the data isn't sufficiently recent, update anyway.  As
+            # the conditions are rather involved, they're broken up here
+            # to make them easy to understand
+            now = _now()
+            if interval == "intraday":
+                update = False
+
+            if interval == "daily" and \
+               (time.year != now.year or \
+               frame.index[0].dayofyear != now.dayofyear):
+                update = False
+
+            now = _now()
+            if interval == "weekly" and frame.index[0].week == now.week:
+                update = False
+
+            # If the data isn't recent, update
+            if interval == "monthly" and frame.index[0].month == now.month:
+                update = False
+
+        if not update:
+            # No update needed, just return the data
+            self._add_memory_cache(key, frame)
+            return frame
+
+        return None
+
+    def _store_persistent_cache(self, time: pd.Timestamp, interval: str, data):
+        """
+        Stores dataframe +data+ for a given +time+ for associated with a given
+        +interval+ (such as "day") to a persistent space.  For this
+        implementation, this involves storing a CSV in a file hierarchy.
+        """
+        csv = self.__get_csv_path(time, interval)
+        csv_dir = csv.parent
+        csv_dir.mkdir(exist_ok=True, parents=True)
+        data.to_csv(csv, index_label='time')
 
     def intraday(self, day: pd.Timestamp):
         """
@@ -138,16 +249,8 @@ class AVDataProvider(DataProvider):
         # TODO handle today data
 
         # First, check if the data is already cached
-        cache_dir = self.cache/self.ticker/str(day.year)/str(day.month)
-        csv = cache_dir/f"{day.day}_per_minute.csv"
-        data = self._check_local_cache(csv)
-        if data is not None:
-            return data
-        if cache_dir.exists() and csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-            self._add_local_cache(csv, frame)
+        frame = self._get_cached_data(day, "intraday")
+        if frame is not None:
             return frame
 
         # Otherwise, download it.  Intraday data is divided into 30-day
@@ -166,44 +269,20 @@ class AVDataProvider(DataProvider):
         # Cache all downloaded data - no point in wasting queries!
         grouper = pd.Grouper(freq='D')
         for date, group in request_frame.groupby(grouper):
-            date_dir = self.cache/self.ticker/str(date.year)/str(date.month)
-            date_csv = date_dir/f"{date.day}_per_minute.csv"
-            if not date_csv.exists():
-                date_dir.mkdir(exist_ok=True, parents=True)
-                group.to_csv(date_csv, index_label='time')
+            self._store_persistent_cache(date, "intraday", group)
 
         # Try again.  If there's still no data, there probably isn't any.
-        if csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-            self._add_local_cache(csv, frame)
-            return frame
-
-        return None
+        frame = self._get_cached_data(day, "intraday")
+        return frame
 
     def daily(self, year: pd.Timestamp):
         """
         Gets the yearly data for a given +year+.
         """
         # First, check if the data is already cached
-        now = _now()
-        cache_dir = self.cache/self.ticker/str(year.year)
-        csv = cache_dir/"per_day.csv"
-        data = self._check_local_cache(csv)
-        if data is not None:
-            return data
-        if cache_dir.exists() and csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-
-            # If the data is from this year yet it isn't today's data,
-            # update anyway.
-            if year.year != now.year or \
-               frame.index[0].dayofyear != now.dayofyear:
-                self._add_local_cache(csv, frame)
-                return frame
+        frame = self._get_cached_data(year, "daily")
+        if frame is not None:
+            return frame
 
         # Update from remote
         params = {"function": "TIME_SERIES_DAILY",
@@ -214,43 +293,20 @@ class AVDataProvider(DataProvider):
         # Cache all returned data
         grouper = pd.Grouper(freq='Y')
         for date, group in request_frame.groupby(grouper):
-            date_dir = self.cache/self.ticker/str(date.year)
-            date_csv = date_dir/"per_day.csv"
-
-            # If the CSV is missing OR it's this year, then cache
-            if not date_csv.exists() or date.year == now.year:
-                date_dir.mkdir(exist_ok=True, parents=True)
-                group.to_csv(date_csv, index_label='time')
+            self._store_persistent_cache(date, "daily", group)
 
         # Try again.  If there's still no data, there probably isn't any.
-        if csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-            self._add_local_cache(csv, frame)
-            return frame
-        return None
+        frame = self._get_cached_data(year, "daily")
+        return frame
 
     def weekly(self):
         """
         Returns a frame containing all weekly data.
         """
         # First, check if the data is already cached
-        now = _now()
-        cache_dir = self.cache/self.ticker
-        csv = cache_dir/"per_week.csv"
-        data = self._check_local_cache(csv)
-        if data is not None:
-            return data
-        if cache_dir.exists() and csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-
-            # If the data isn't recent, update
-            if frame.index[0].week == now.week:
-                self._add_local_cache(csv, frame)
-                return frame
+        frame = self._get_cached_data(_now(), "weekly")
+        if frame is not None:
+            return frame
 
         # Update from remote
         # Set up call parameters
@@ -259,39 +315,20 @@ class AVDataProvider(DataProvider):
         request_frame = self._api_request(**params)
 
         # Cache returned data.
-        if not cache_dir.exists():
-            cache_dir.mkdir(exist_ok=True, parents=True)
-        request_frame.to_csv(csv, index_label='time')
+        self._store_persistent_cache(_now(), "weekly", request_frame)
 
         # Try again.  If there's still no data, there probably isn't any.
-        if csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-            self._add_local_cache(csv, frame)
-            return frame
-        return None
+        frame = self._get_cached_data(_now(), "weekly")
+        return frame
 
     def monthly(self):
         """
         Returns a frame containing all monthly data.
         """
         # First, check if the data is already cached
-        now = _now()
-        cache_dir = self.cache/self.ticker
-        csv = cache_dir/"per_month.csv"
-        data = self._check_local_cache(csv)
-        if data is not None:
-            return data
-        if cache_dir.exists() and csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-
-            # If the data isn't recent, update
-            if frame.index[0].month == now.month:
-                self._add_local_cache(csv, frame)
-                return frame
+        frame = self._get_cached_data(_now(), "monthly")
+        if frame is not None:
+            return frame
 
         # Update from remote
         # Set up call parameters
@@ -300,18 +337,11 @@ class AVDataProvider(DataProvider):
         request_frame = self._api_request(**params)
 
         # Cache returned data.
-        if not cache_dir.exists():
-            cache_dir.mkdir(exist_ok=True, parents=True)
-        request_frame.to_csv(csv, index_label='time')
+        self._store_persistent_cache(_now(), "monthly", request_frame)
 
         # Try again.  If there's still no data, there probably isn't any.
-        if csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-            self._add_local_cache(csv, frame)
-            return frame
-        return None
+        frame = self._get_cached_data(_now(), "monthly")
+        return frame
 
     def _api_request(self, **kwargs: Dict[str, str]) -> pd.DataFrame:
         """
