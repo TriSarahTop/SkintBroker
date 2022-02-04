@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict
 
 import pandas as pd
+import psycopg2
 import requests
 
 
@@ -66,11 +67,11 @@ class DataProvider:
 
 class AVDataProvider(DataProvider):
     """
-    An implementation of DataProvider which uses the AlphaVantage API.
+    A subclass of DataProvider which uses the AlphaVantage API.
     """
 
     def __init__(self, ticker: str, *,
-                 reqs_per_minute: int = 5, cache: str = "cache",
+                 reqs_per_minute: int = 5,
                  memory_cache_size: int = 10,
                  **kwargs: Dict[str, Any]):
         """
@@ -78,8 +79,6 @@ class AVDataProvider(DataProvider):
 
         +reqs_per_minute+ is the number of requests allowed per minute.
         +ticker+ provides the ticker symbol for the underlying FD.
-        +cache+ provides a directory which the DataProvider can use to
-        organize data.
         +memory_cache_size+ is the total number of entries to keep on-hand to
         speed up repeated accesses.
 
@@ -88,17 +87,11 @@ class AVDataProvider(DataProvider):
         """
         self.ticker = ticker
         self.reqs_per_minute = reqs_per_minute
-        self.cache = pathlib.Path(cache)
         self.memory_cache_size = memory_cache_size
 
         self._calls = []
         self._memory_cache = {}
         self._memory_cache_history = []
-
-        # Ensure the cache is suitable
-        if self.cache.exists() and not self.cache.is_dir():
-            raise RuntimeError("Cache must be a directory")
-        self.cache.mkdir(exist_ok=True, parents=True)
 
         # Get AlphaVantage API key
         self.api_key = os.environ.get("SKINTBROKER_AV_API_KEY")
@@ -174,62 +167,12 @@ class AVDataProvider(DataProvider):
         # Next, check the persistent cache
         return self._check_persistent_cache(time, interval)
 
-    def __get_csv_path(self, time: pd.Timestamp, interval: str):
-        """
-        Gets the CSV associated with a given +time+ and +interval+.
-        """
-        cache_dir = self.cache/self.ticker
-        key = self._get_key_by_timestamp(time, interval)
-        if interval == "intraday":
-            return cache_dir/str(time.year)/str(time.month)/f"{key}.csv"
-        if interval == "daily":
-            return cache_dir/str(time.year)/f"{key}.csv"
-        if interval in ["weekly", "monthly"]:
-            return cache_dir/f"{key}.csv"
-        else:
-            raise RuntimeError("Interval '{interval}' not supported!")            
-
     def _check_persistent_cache(self, time: pd.Timestamp, interval: str):
         """
         Gets any data cached in persistent space for a given +time+ for
         data associated with a given +interval+, such as "day".  For
         this implementation, this includes searching a file hierarchy.
         """
-        key = self._get_key_by_timestamp(time, interval)
-        csv = self.__get_csv_path(time, interval)
-
-        update = True
-        if csv.exists():
-            frame = pd.read_csv(csv, parse_dates=[0],
-                                infer_datetime_format=True,
-                                index_col='time')
-
-            # If the data isn't sufficiently recent, update anyway.  As
-            # the conditions are rather involved, they're broken up here
-            # to make them easy to understand
-            now = _now()
-            if interval == "intraday":
-                update = False
-
-            if interval == "daily" and \
-               (time.year != now.year or \
-               frame.index[0].dayofyear != now.dayofyear):
-                update = False
-
-            now = _now()
-            if interval == "weekly" and frame.index[0].week == now.week:
-                update = False
-
-            # If the data isn't recent, update
-            if interval == "monthly" and frame.index[0].month == now.month:
-                update = False
-
-        if not update:
-            # No update needed, just return the data
-            self._add_memory_cache(key, frame)
-            return frame
-
-        return None
 
     def _store_persistent_cache(self, time: pd.Timestamp, interval: str, data):
         """
@@ -237,10 +180,6 @@ class AVDataProvider(DataProvider):
         +interval+ (such as "day") to a persistent space.  For this
         implementation, this involves storing a CSV in a file hierarchy.
         """
-        csv = self.__get_csv_path(time, interval)
-        csv_dir = csv.parent
-        csv_dir.mkdir(exist_ok=True, parents=True)
-        data.to_csv(csv, index_label='time')
 
     def intraday(self, day: pd.Timestamp):
         """
@@ -412,6 +351,273 @@ class AVDataProvider(DataProvider):
         for day in days:
             if day.weekday() <= 4:
                 self.intraday(day)
+
+
+class AVBasicDataProvider(AVDataProvider):
+    """
+    A subclass of DataProvider which uses the AlphaVantage API.
+    """
+
+    def __init__(self, ticker: str,
+                 cache: str = "cache", **kwargs: Dict[str, Any]):
+        """
+        Init function.
+
+        +cache+ provides a directory which the DataProvider can use to
+        speed up repeated accesses.
+        """
+        super().__init__(ticker, **kwargs)
+        self.cache = pathlib.Path(cache)
+
+        # Ensure the cache is suitable
+        if self.cache.exists() and not self.cache.is_dir():
+            raise RuntimeError("Cache must be a directory")
+        self.cache.mkdir(exist_ok=True, parents=True)
+
+    def __get_csv_path(self, time: pd.Timestamp, interval: str):
+        """
+        Gets the CSV associated with a given +time+ and +interval+.
+        """
+        cache_dir = self.cache/self.ticker
+        key = self._get_key_by_timestamp(time, interval)
+        if interval == "intraday":
+            return cache_dir/str(time.year)/str(time.month)/f"{key}.csv"
+        if interval == "daily":
+            return cache_dir/str(time.year)/f"{key}.csv"
+        if interval in ["weekly", "monthly"]:
+            return cache_dir/f"{key}.csv"
+        else:
+            raise RuntimeError("Interval '{interval}' not supported!")            
+
+
+    def _check_persistent_cache(self, time: pd.Timestamp, interval: str):
+        """
+        Gets any data cached in persistent space for a given +time+ for
+        data associated with a given +interval+, such as "day".  For
+        this implementation, this includes searching a file hierarchy.
+        """
+        key = self._get_key_by_timestamp(time, interval)
+        csv = self.__get_csv_path(time, interval)
+
+        update = True
+        if csv.exists():
+            frame = pd.read_csv(csv, parse_dates=[0],
+                                infer_datetime_format=True,
+                                index_col='time')
+
+            # If the data isn't sufficiently recent, update anyway.  As
+            # the conditions are rather involved, they're broken up here
+            # to make them easy to understand
+            now = _now()
+            if interval == "intraday":
+                update = False
+
+            if interval == "daily" and \
+               (time.year != now.year or \
+               frame.index[0].dayofyear != now.dayofyear):
+                update = False
+
+            now = _now()
+            if interval == "weekly" and frame.index[0].week == now.week:
+                update = False
+
+            # If the data isn't recent, update
+            if interval == "monthly" and frame.index[0].month == now.month:
+                update = False
+
+        if not update:
+            # No update needed, just return the data
+            self._add_memory_cache(key, frame)
+            return frame
+
+        return None
+
+    def _store_persistent_cache(self, time: pd.Timestamp, interval: str, data):
+        """
+        Stores dataframe +data+ for a given +time+ for associated with a given
+        +interval+ (such as "day") to a persistent space.  For this
+        implementation, this involves storing a CSV in a file hierarchy.
+        """
+        csv = self.__get_csv_path(time, interval)
+        csv_dir = csv.parent
+        csv_dir.mkdir(exist_ok=True, parents=True)
+        data.to_csv(csv, index_label='time')
+
+
+class AVPostgresDataProvider(AVDataProvider):
+    """
+    An implementation of DataProvider which uses the AlphaVantage API.
+    """
+
+    def __init__(self, ticker: str, *,
+                 postgres_server: str = "localhost",
+                 postgres_username: str = "",
+                 postgres_database: str = "skintbroker",
+                 **kwargs: Dict[str, Any]):
+        """
+        Init function.
+
+        +reqs_per_minute+ is the number of requests allowed per minute.
+        +ticker+ provides the ticker symbol for the underlying FD.
+        +memory_cache_size+ is the total number of entries to keep on-hand to
+        speed up repeated accesses.
+        +postgres_server+ is the URL of the postgres server used for persistent
+        caching
+        +postgres_username+ is the username for the postgres server
+        +postgres_database+ is the database on the postgres server
+
+        NOTE: This object assumes it is the only user of the API key at any
+        given time, and will attempt the maximum number of accesses possible.
+        """
+        super().__init__(ticker, **kwargs)
+        self.server = postgres_server
+        self.username = postgres_username
+        self.database = postgres_database
+
+        self.columns = ['open', 'high', 'low', 'close', 'volume']
+
+        # Get Postgres database password
+        self.password = os.environ.get("SKINTBROKER_AV_POSTGRES_PASS")
+        if not self.password:
+            raise RuntimeError("No Postgres database password - please set "
+                               "SKINTBROKER_AV_POSTGRES_PASS")
+
+        # Make server connection
+        self.connection = self.__connect_to_db()
+        self.cursor = self.connection.cursor()
+
+        # Verify or create all tables.  In the future, we could also create
+        # the database, but we'd like to ensure that the user is placing
+        # information in the right place.  Thus, error if the database is
+        # not present.
+        self.__verify_tables()
+
+    def _check_persistent_cache(self, time: pd.Timestamp, interval: str):
+        """
+        Gets any data cached in persistent space for a given +time+ for
+        data associated with a given +interval+, such as "day".  For
+        this implementation, this includes searching a file hierarchy.
+        """
+
+        # First, query the database to and try to get the requisite values.
+        # Start by generating the query, using conditions based on the
+        # interval type
+        query = "SELECT * FROM {ticker}_{interval}"
+        if interval in ["intraday", "daily"]:
+            query +=  f" WHERE EXTRACT(month from \"timestamp\") = {time.month}"
+            if interval == "intraday":
+                query += f" AND EXTRACT(day from \"timestamp\") = {time.day}"
+        elif interval in ["weekly", "monthly"]:
+            # Data is small enough that no special condition is needed
+            pass
+        else:
+            raise RuntimeError(f"Unknown interval: {interval}")
+        query_vars = {'ticker': self.ticker.lower(),
+                      'interval': interval}
+
+        # Next, perform the query and generate a dataframe
+        self.cursor.execute(query.format(**query_vars))
+        data = self.cursor.fetchall()
+        frame = pd.DataFrame(data, columns=["timestamp", *self.columns])
+
+        # Format the dataframe correctly
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+        frame.set_index("timestamp", drop=True, inplace=True)
+
+        # Determine if this data is complete or should be ignored
+        update = True
+        if not frame.empty:
+
+            # If the data isn't sufficiently recent, update anyway.  As
+            # the conditions are rather involved, they're broken up here
+            # to make them easy to understand
+            now = _now()
+            if interval == "intraday":
+                update = False
+
+            if interval == "daily" and \
+               (time.year != now.year or \
+               frame.index[0].dayofyear != now.dayofyear):
+                update = False
+
+            now = _now()
+            if interval == "weekly" and frame.index[0].week == now.week:
+                update = False
+
+            # If the data isn't recent, update
+            if interval == "monthly" and frame.index[0].month == now.month:
+                update = False
+
+        if not update:
+            # No update needed, just return the data
+            key = self._get_key_by_timestamp(time, interval)
+            self._add_memory_cache(key, frame)
+            return frame
+
+        return None
+
+    def _store_persistent_cache(self, time: pd.Timestamp, interval: str, data):
+        """
+        Stores dataframe +data+ for a given +time+ for associated with a given
+        +interval+ (such as "day") to a persistent space.  For this
+        implementation, store it to a postgres database.
+        """
+        # The original implementation of this function used the standard approach
+        # of converting the data into an in-memory CSV format, then converting it
+        # to an SQL request via psycopg2's built-in copy.  This method was the
+        # overall fastest, according to a comparative study, but broke down when
+        # attempting update-on-conflict inserts (upserts).  The new method allows
+        # upserts, but at the expense of generating a brutally large mega-query,
+        # the speed of which is at the mercy of psycopg2's internals.
+
+        # First, make sure there's some data to work with
+        if data.empty:
+            return
+        
+        # First, genreate the mega-query
+        query = ""
+        for index, row in data.iterrows():
+            query += (f"INSERT INTO {self.ticker.lower()}_{interval} "
+                      "(timestamp, open, high, low, close, volume) VALUES("
+                      f"'{index}', {row['open']}, {row['high']}, "
+                      f"{row['low']}, {row['close']}, {row['volume']}"
+                      ") ON CONFLICT (timestamp) DO UPDATE SET "
+                      "(open, high, low, close, volume) = "
+                      "(EXCLUDED.open, EXCLUDED.high, EXCLUDED.low,"
+                      " EXCLUDED.close, EXCLUDED.volume);\n")
+
+        # Then execute the mega-query
+        self.cursor.execute(query)
+        self.connection.commit()
+
+    def __connect_to_db(self):
+        """
+        Establish and return a connection to the postgres database.
+        """
+        # Don't catch any exceptions - they're sufficiently verbose and it's
+        # best if they just tank the attempt.
+        return psycopg2.connect(host=self.server,
+                                database=self.database,
+                                user=self.username,
+                                password=self.password)
+
+    def __verify_tables(self):
+        """
+        Populates the database, ensuring that all relevant tables are
+        present.  If they're already there, leave them alone.
+        """
+        # First, load the query template
+        sql_path = pathlib.Path(os.path.dirname(os.path.realpath(__file__)))/"resources"/"sql"
+        populate_db_path = sql_path/"populate_db.sql"
+        query = populate_db_path.read_text()
+
+        # Next, set up the query variables
+        query_vars = {'ticker': self.ticker.lower(),
+                      'username': self.username}
+
+        # Execute
+        self.cursor.execute(query.format(**query_vars))
+        self.connection.commit()
 
 
 def _now() -> pd.Timestamp:

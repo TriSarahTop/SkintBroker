@@ -19,6 +19,7 @@ First things first, setup.  SkintBroker works pretty much out of the box, as lon
 __mxnet 1.9.0__ (GPU Enabled Preferred)\
 __pandas 1.3.5__\
 __requests 2.27.0__\
+__psycopg2 2.9.3__\
 __matplotlib 3.5.1__\
 __seaborn 0.11.2__\
 __PyQt5 5.12.2__\
@@ -26,7 +27,7 @@ __PyYAML 6.0__
 
 I haven't tested newer versions of these packages, though SkintBroker doesn't leverage many arcane features outside of MXNet, so there shouldn't be too many problems upgrading.  It is, however, highly dependent on the ever-evolving MXNet package, so alter that version at your own risk.
 
-Additionally, make sure you have a couple GB of disk space and a directory with rwx permissions for data caching.  More on this later.
+Additionally, make sure you have a couple GB of disk space and a directory with rwx permissions for data caching.  More on this later.  Alternatively, if you'd like to take advantage of SQL database caching, make sure you have access to a similarly provisioned postgres server of version 14.1 or later.
 
 ### Command Line
 
@@ -122,6 +123,8 @@ _Independent package support is still ongoing and will probably have to wait for
 The actual data for training and using the model is provided by a Provider.  While we defer a discussion of its internals until the Design section, suffice it to say that the Provider is responsible for gathering raw data from a reliable source, caching it efficiently, and forwarding it to the model.
 
 Currently, the default provider gathers data from AlphaVantage.  To use it, first go to www.alphavantage.co and get an API key.  Next, edit the parameters in the AVProvider blueprint - they are set by default to work with the free API key, but if you're willing to pay more for faster accesses, you'll want to adjust them accordingly.  Finally, make sure to set the ```SKINTBROKER_AV_API_KEY``` environment variable to your API key.  This system avoids placing it in the blueprint file and committing it by accident.
+
+Alternatively, a PostgreSQL variant of the default provider is available.  To use it, make sure you have access to a postgres 14.1+ server, along with your username and password handy.  Create a database specifically for SkintBroker on that server - you can point the provider to it with arguments in the blueprint file.  Make sure you set 'user' to a user with permission to access that database.  Finally, note that for security reasons, the password is handled as an environment variable, similar to the AV API key above.  Simply set ```SKINTBROKER_AV_POSTGRES_PASS``` to your password, and the software will take it from there. 
 
 ## Design
 

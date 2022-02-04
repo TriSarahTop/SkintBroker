@@ -219,7 +219,8 @@ def build_provider(ticker: str, params: Dict[str, Any]) \
     """
     Builds a data provider from a dictionary of +params+ and a +ticker+.
     """
-    types = {"alphavantage": providers.AVDataProvider}
+    types = {"alphavantage": providers.AVBasicDataProvider,
+             "alphavantage_postgres": providers.AVPostgresDataProvider}
 
     # First, gather provider type and parameters
     prov = params.get("type")

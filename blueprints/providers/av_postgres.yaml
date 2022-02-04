@@ -1,0 +1,8 @@
+# Default initialization for an AlphaVantage data presenter
+---
+type: alphavantage_postgres
+params:
+  postgres_server: localhost
+  postgres_username: skintbroker
+  postgres_database: skintbroker
+  local_cache_size: 10
