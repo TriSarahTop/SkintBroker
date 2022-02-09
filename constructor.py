@@ -219,13 +219,22 @@ def build_provider(ticker: str, params: Dict[str, Any]) \
     """
     Builds a data provider from a dictionary of +params+ and a +ticker+.
     """
-    types = {"alphavantage": providers.AVBasicDataProvider,
-             "alphavantage_postgres": providers.AVPostgresDataProvider}
+    prov_types = {"alphavantage": providers.AVDataProvider}
+    cache_types = {"postgres": providers.PostgresDataCacheHandler,
+                   "csv": providers.CSVDataCacheHandler}
 
     # First, gather provider type and parameters
-    prov = params.get("type")
-    prov_type = safe_get(types, prov)
-    prov_params = safe_get(params, "params")
+    prov = params.get("provider_type")
+    prov_type = safe_get(prov_types, prov)
+    prov_params = safe_get(params, "provider_params")
+
+    # Next, gather the cache handler type and params
+    cache = params.get("cache_type")
+    cache_type = safe_get(cache_types, cache)
+    cache_params = safe_get(params, "cache_params")
+
+    # Construct the handler
+    handler = cache_type(ticker, **cache_params)
 
     # Then construct and return the provider
-    return prov_type(ticker, **prov_params)
+    return prov_type(ticker, cache_handler=handler,  **prov_params)

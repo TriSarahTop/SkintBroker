@@ -1,7 +1,9 @@
-# Default initialization for an AlphaVantage data presenter
+# Default initialization for an AlphaVantage data presenter using the CSV cache
 ---
-type: alphavantage
-params:
-  cache: cache
+provider_type: alphavantage
+provider_params:
   reqs_per_minute: 5
-  local_cache_size: 10
+cache_type: csv
+cache_params:
+  cache: cache
+  memory_cache_size: 10

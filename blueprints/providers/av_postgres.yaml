@@ -1,8 +1,11 @@
-# Default initialization for an AlphaVantage data presenter
+# Default initialization for an AlphaVantage data presenter using the postgres cache
 ---
-type: alphavantage_postgres
-params:
+provider_type: alphavantage
+provider_params:
+  reqs_per_minute: 5
+cache_type: postgres
+cache_params:
   postgres_server: localhost
   postgres_username: skintbroker
   postgres_database: skintbroker
-  local_cache_size: 10
+  memory_cache_size: 10
