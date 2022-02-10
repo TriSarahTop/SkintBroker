@@ -660,4 +660,4 @@ def _now() -> pd.Timestamp:
     """
     Returns the current DateTime.
     """
-    return pd.to_datetime("now")
+    return pd.Timestamp.now(tz="EST")
