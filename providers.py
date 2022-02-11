@@ -246,7 +246,8 @@ class PostgresDataCacheHandler(DataCacheHandler):
         # interval type
         query = "SELECT * FROM {ticker}_{interval}"
         if interval in ["intraday", "daily"]:
-            query +=  f" WHERE EXTRACT(month from \"timestamp\") = {time.month}"
+            query += f" WHERE EXTRACT(year from \"timestamp\") = {time.year}"
+            query += f" AND EXTRACT(month from \"timestamp\") = {time.month}"
             if interval == "intraday":
                 query += f" AND EXTRACT(day from \"timestamp\") = {time.day}"
         elif interval in ["weekly", "monthly"]:
@@ -868,6 +869,7 @@ class FTXDataProvider(DataProvider):
         days = pd.date_range(end=now.floor('d'), freq='D', periods=360 * 2 - 1)
         for day in days:
             self.intraday(day)
+
 
 def _now() -> pd.Timestamp:
     """
