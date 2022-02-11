@@ -7,6 +7,7 @@ defines methods by which market information can be requested and presented.
 
 from abc import abstractmethod
 from io import StringIO
+import json
 import os
 import pathlib
 import time
@@ -314,7 +315,7 @@ class PostgresDataCacheHandler(DataCacheHandler):
         # First, make sure there's some data to work with
         if data.empty:
             return
-        
+
         # First, genreate the mega-query
         query = ""
         for index, row in data.iterrows():
@@ -655,6 +656,218 @@ class AVDataProvider(DataProvider):
             if day.weekday() <= 4:
                 self.intraday(day)
 
+
+class FTXDataProvider(DataProvider):
+    """
+    A subclass of DataProvider which uses the FTX Crypto Exchange API.
+    """
+
+    def __init__(self, ticker: str, *,
+                 reqs_per_minute: int = 60,
+                 **kwargs: Dict[str, Any]):
+        """
+        Init function.
+
+        +reqs_per_minute+ is the number of requests allowed per minute.
+        +ticker+ provides the ticker symbol for the underlying FD.
+        +memory_cache_size+ is the total number of entries to keep on-hand to
+        speed up repeated accesses.
+        """
+        super().__init__(**kwargs)
+        self.ticker = ticker
+        self.reqs_per_minute = reqs_per_minute
+        self._calls = []
+
+    def intraday(self, day: pd.Timestamp):
+        """
+        Gets the intraday data for a given day.
+        """
+        # TODO handle today data
+
+        # First, make sure there is a timezone associated with the
+        # data.  If not, assume the day starts ate 00:00:00 EST.
+        if not day.tz:
+            day = day.tz_localize('EST', nonexistent='shift_backward')
+        else:
+            day = day.astimezone('EST')
+
+        # Next, check if the data is already cached
+        frame = self.cache_handler.retrieve(day, "intraday")
+        if frame is not None:
+            return frame
+
+        # Otherwise, download it. Generate midnight start and end times,
+        # ensuring that all stay exactly within the bounds of the day.
+        start = day.floor('d')
+        end = day + pd.Timedelta(days=1) - pd.Timedelta(minutes=1)
+
+        # Perform request.  We want a 60 second window length.
+        query = self._gen_query(start, end, 60)
+        request_frame = self._api_request(query)
+        if request_frame.empty:
+            return None
+
+        # Cache all downloaded data - no point in wasting queries!
+        grouper = pd.Grouper(freq='D')
+        for date, group in request_frame.groupby(grouper):
+            self.cache_handler.store(date, "intraday", group)
+
+        # Try again.  If there's still no data, there probably isn't any.
+        frame = self.cache_handler.retrieve(day, "intraday")
+        return frame
+
+    def daily(self, year: pd.Timestamp):
+        """
+        Gets the yearly data for a given +year+.
+        """
+        # First, check if the data is already cached
+        frame = self.cache_handler.retrieve(year, "daily")
+        if frame is not None:
+            return frame
+
+        # Perform request.  We want a one day window length.
+        query = self._gen_query(self.first(), self.latest(), 86400)
+        request_frame = self._api_request(query)
+        if request_frame.empty:
+            return None
+
+        # Cache all returned data
+        grouper = pd.Grouper(freq='Y')
+        for date, group in request_frame.groupby(grouper):
+            self.cache_handler.store(date, "daily", group)
+
+        # Try again.  If there's still no data, there probably isn't any.
+        frame = self.cache_handler.retrieve(year, "daily")
+        return frame
+
+    def weekly(self):
+        """
+        Returns a frame containing all weekly data.
+        """
+        # First, check if the data is already cached
+        frame = self.cache_handler.retrieve(_now(), "weekly")
+        if frame is not None:
+            return frame
+
+        # Perform request.  We want a seven day window length.
+        query = self._gen_query(self.first(), self.latest(), 86400 * 7)
+        request_frame = self._api_request(query)
+        if request_frame.empty:
+            return None
+
+        # Cache returned data.
+        self.cache_handler.store(_now(), "weekly", request_frame)
+
+        # Try again.  If there's still no data, there probably isn't any.
+        frame = self.cache_handler.retrieve(_now(), "weekly")
+        return frame
+
+    def monthly(self):
+        """
+        Returns a frame containing all monthly data.
+        """
+        # First, check if the data is already cached
+        frame = self.cache_handler.retrieve(_now(), "monthly")
+        if frame is not None:
+            return frame
+
+        # Perform request.  We want a 30 day window length, per an
+        # archaic standard set by the AlphaVantage provider.
+        query = self._gen_query(self.first(), self.latest(), 86400 * 30)
+        request_frame = self._api_request(query)
+        if request_frame.empty:
+            return None
+
+        # Cache returned data.
+        self.cache_handler.store(_now(), "monthly", request_frame)
+
+        # Try again.  If there's still no data, there probably isn't any.
+        frame = self.cache_handler.retrieve(_now(), "monthly")
+        return frame
+
+    def _gen_query(self, start: pd.Timestamp, end: pd.Timestamp,
+                   interval: int) -> str:
+        """
+        Generates a query string for historic data starting at +start+ and
+        ending at +end+, with an +interval+ second interval between
+        entries
+
+        Note that any timestamps /must/ be timezone aware.
+        """
+        # Set up parameters.  Note that timestamps are in epoch time.
+        params = {
+            "start_time": start.timestamp(),
+            "end_time": end.timestamp(),
+            "resolution": interval
+        }
+
+        # Generate the query
+        site = f"https://ftx.com/api/markets/{self.ticker}/USD/candles?"
+        params = [f"{key}={val}" for key, val in params.items()]
+        return site + "&".join(params)
+
+    def _api_request(self, query: str) -> pd.DataFrame:
+        """
+        Performs a passed API +query+, converting the returned JSON into a
+        DataFrame.
+        """
+
+        # Perform call limit bookkeeping, and delay if needed.
+        if len(self._calls) >= self.reqs_per_minute:
+            oldest_call = self._calls.pop(0)
+            to_wait = 60 - (_now() - oldest_call).seconds
+            if to_wait >= 0:
+                time.sleep(to_wait + 1)
+
+        # Call the API and generate the dataframe
+        print("Querying: " + query)
+        response = requests.get(query)
+        response.encoding = 'utf-8'
+
+        # Response is JSON
+        frame = pd.json_normalize(json.load(StringIO(response.text)), 'result',
+                                  errors='ignore')
+        # Convert to the expected frame format
+        frame.drop(columns=['time'], inplace=True)
+        frame.rename(columns={'startTime': 'timestamp'}, inplace=True)
+        frame['timestamp'] = pd.to_datetime(frame['timestamp']).dt.tz_convert('EST')
+        frame.set_index("timestamp", drop=True, inplace=True)
+
+        # Record this call for future checks
+        self._calls.append(_now())
+
+        return frame
+
+    def first(self) -> pd.Timestamp:
+        """
+        Returns the earliest date for which all types of data are available.
+        """
+        # Shoot for two years ago, as it starts getting spotty before that.
+        return _now() - pd.Timedelta(360 * 2 - 1, unit='d')
+
+    def latest(self) -> pd.Timestamp:
+        """
+        Returns the latest date for which all types of data are available.
+        """
+        # Yesterday is fine for now
+        return _now() - pd.Timedelta(1, unit='d')
+
+    def access_all(self) -> None:
+        """
+        Simulates accesses of all kinds.  Designed to allow caching
+        implementations to perform all of their caching up front.
+        """
+        # First, handle daily, weekly, and monthly entries for the last 20
+        # years.  As this comes in one immense blob, just access that.
+        now = _now()
+        self.monthly()
+        self.weekly()
+        self.daily(now)
+
+        # Then handle intraday for the last 2 years.
+        days = pd.date_range(end=now.floor('d'), freq='D', periods=360 * 2 - 1)
+        for day in days:
+            self.intraday(day)
 
 def _now() -> pd.Timestamp:
     """

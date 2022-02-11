@@ -1,0 +1,12 @@
+# Default initialization for an FTX Data Presenter.  Use Postgres by default to avoid
+# any issues with splitting the data for CSV storage.
+---
+provider_type: ftx
+provider_params:
+  reqs_per_minute: 60
+cache_type: postgres
+cache_params:
+  postgres_server: localhost
+  postgres_username: skintbroker
+  postgres_database: skintbroker
+  memory_cache_size: 10
